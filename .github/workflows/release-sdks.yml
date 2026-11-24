@@ -1,0 +1,198 @@
+name: Release SDKs
+
+# Issue #367. Tag-triggered (vX.Y.Z / vX.Y.Z-rc.N) release of
+# @cypher-gridpay/contracts-sdk (npm, provenance) and cypher-gridpay-sdk (PyPI,
+# Trusted Publishing) with no long-lived registry tokens. See docs/SDK_RELEASE.md
+# for the one-time npm/PyPI/environment setup the maintainers must do.
+# workflow_dispatch defaults to a dry run (build + test + version check only).
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to validate (e.g. 1.2.0 or 1.2.0-rc.1), without the leading v
+        required: true
+      dry_run:
+        description: Dry run (skip publishing and GitHub Release)
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-sdks-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, verify versions and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+      dry_run: ${{ steps.ver.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Resolve version and verify it matches both SDK manifests
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#v}"
+            dry="$INPUT_DRY"
+          else
+            version="${REF_NAME#v}"
+            dry=false
+          fi
+          python3 - "$version" <<'PY'
+          import json, re, sys, tomllib
+          v = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", v):
+              sys.exit(f"::error::'{v}' is not a semver version")
+          # PEP 440 form of the semver pre-release (1.2.0-rc.1 -> 1.2.0rc1)
+          m = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(a|b|rc|alpha|beta)\.?(\d+))?", v)
+          py = v if not "-" in v else None
+          if m and m.group(2):
+              tag = {"alpha": "a", "beta": "b"}.get(m.group(2), m.group(2))
+              py = f"{m.group(1)}{tag}{m.group(3)}"
+          elif "-" in v:
+              sys.exit("::error::pre-release must look like -rc.N, -beta.N or -alpha.N")
+          ts = json.load(open("sdk/typescript/package.json"))["version"]
+          pyv = tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"]
+          bad = []
+          if ts != v: bad.append(f"sdk/typescript/package.json={ts} (expected {v})")
+          if pyv != py: bad.append(f"sdk/python/pyproject.toml={pyv} (expected {py})")
+          if bad:
+              sys.exit("::error::Version mismatch with tag: " + "; ".join(bad))
+          print(f"versions OK: npm {ts}, pypi {pyv}")
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$([[ "$version" == *-* ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust (cached)
+        uses: ./.github/actions/setup-rust-cached
+
+      - name: Build contracts and checksum manifest
+        run: |
+          set -euo pipefail
+          make build
+          mkdir -p release/wasm
+          for dir in core/target/wasm32v1-none/release orchestrator/target/wasm32v1-none/release; do
+            for w in "$dir"/*.wasm; do
+              [ -f "$w" ] || continue
+              stellar contract optimize --wasm "$w"
+              cp "$w" release/wasm/
+            done
+          done
+          (cd release/wasm && sha256sum *.wasm > checksums.sha256 && cat checksums.sha256)
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Test and pack TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          npm install
+          npm run typecheck
+          npm test
+          npm run build
+          mkdir -p ../../release/dist
+          npm pack --pack-destination ../../release/dist
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Python SDK
+        working-directory: sdk/python
+        run: |
+          # The package has no pytest suite yet; build validation only.
+          python -m pip install build twine
+          python -m build --outdir ../../release/pydist
+          python -m twine check ../../release/pydist/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-release
+          path: release/
+
+  publish-npm:
+    name: Publish to npm (provenance)
+    needs: build
+    if: needs.build.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-release
+          path: release
+      - name: Publish
+        env:
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # npm >= 11.5.1 is required for OIDC trusted publishing.
+          npm install -g npm@^11.5.1
+          tag=latest; [ "$PRERELEASE" = "true" ] && tag=next
+          npm publish release/dist/*.tgz --provenance --access public --tag "$tag"
+
+  publish-pypi:
+    name: Publish to PyPI (trusted publishing)
+    needs: build
+    if: needs.build.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # OIDC for PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-release
+          path: release
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          packages-dir: release/pydist
+
+  github-release:
+    name: GitHub Release
+    needs: [build, publish-npm, publish-pypi]
+    if: needs.build.outputs.dry_run != 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-release
+          path: release
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          files: |
+            release/wasm/*.wasm
+            release/wasm/checksums.sha256
+            release/dist/*.tgz
+            release/pydist/*
