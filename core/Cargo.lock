@@ -93,6 +93,9 @@ dependencies = [
  "ark-serialize",
  "ark-std",
  "arrayvec",
+ "digest",
+ "educe",
+ "derivative",
  "digest 0.10.7",
  "educe",
  "itertools",
@@ -149,6 +152,7 @@ dependencies = [
  "ark-serialize-derive",
  "ark-std",
  "arrayvec",
+ "digest",
  "digest 0.10.7",
  "num-bigint",
 ]
@@ -1960,6 +1964,7 @@ checksum = "092d55c5563d973c681fb8016fb9bc47a9e8c3d3aa4a5dafcc1c3d4ebc415829"
 dependencies = [
  "base64 0.22.1",
  "sha2 0.10.9",
+ "sha2",
  "stellar-xdr",
  "thiserror 1.0.69",
  "wasmparser",
@@ -2058,6 +2063,8 @@ dependencies = [
  "hex",
  "serde",
  "serde_with",
+ "sha2",
+ "stellar-strkey 0.0.13",
  "sha2 0.10.9",
  "stellar-strkey 0.0.13",
 ]
