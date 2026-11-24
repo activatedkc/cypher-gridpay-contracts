@@ -42,16 +42,33 @@ export interface ContractEvent {
   txHash?: string;
 }
 
+export interface DeprecatedContract {
+  contractId: string;
+  /** Human-readable label / alias of the deprecated contract. */
+  alias?: string;
+  /** Ledger at which the contract was deprecated. */
+  deprecatedAtLedger?: number;
+  /** Optional reason / migration note. */
+  reason?: string;
+}
+
 export interface ContractHealth {
   name: ContractName;
   status: HealthStatus;
+  /** On-chain contract ID (C...). */
+  contractId?: string;
   schemaVersion: string;
   schemaExpected: string;
+  /** Whether the contract is currently paused (emergency circuit breaker). */
+  paused?: boolean;
   ttlLedgersRemaining?: number;
   storageEntries?: number;
   pendingMultisig?: MultisigAction[];
   recentEvents?: ContractEvent[];
   lastCheckedAgo?: string;
+  lastCheckedAgo?: string; // e.g. "4s ago"
+  /** Deprecated contract history from get_deprecated_contracts. */
+  deprecatedContracts?: DeprecatedContract[];
 }
 
 export interface ContractHealthMatrixProps {
@@ -60,6 +77,13 @@ export interface ContractHealthMatrixProps {
   lastSyncAgo?: string;
   /** BCP 47 locale for number formatting */
   locale?: string;
+  lastSyncAgo?: string; // e.g. "4s ago"
+  /** True while an RPC poll is in flight / degraded. */
+  syncing?: boolean;
+  /** Current backoff delay in ms when RPC is degraded (0 = healthy). */
+  backoffMs?: number;
+  /** Last RPC error message, if any. */
+  rpcError?: string | null;
 }
 
 export interface AdminHeaderProps {
@@ -69,6 +93,9 @@ export interface AdminHeaderProps {
   lastSyncAgo?: string;
   onEmergencyPauseClick: () => void;
   locale?: string;
+  syncing?: boolean;
+  backoffMs?: number;
+  rpcError?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +159,12 @@ const LEDGERS_PER_DAY = 17280;
 function ttlWarning(ledgers?: number): boolean {
   if (!ledgers) return false;
   return ledgers < LEDGERS_PER_DAY * 73;
+}
+
+function shortContractId(id?: string): string {
+  if (!id) return "—";
+  if (id.length <= 12) return id;
+  return `${id.slice(0, 6)}…${id.slice(-4)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +277,28 @@ function DrillDownPanel({ contract, viewerRole, dark, onClose, panelId, locale }
         <tbody>
           {[
             {
+              label: "Contract ID",
+              value: (
+                <span title={contract.contractId ?? undefined}>
+                  {contract.contractId ? (
+                    <span style={{ fontFamily: "monospace" }}>{contract.contractId}</span>
+                  ) : (
+                    <span style={{ color: textMuted }}>—</span>
+                  )}
+                </span>
+              ),
+            },
+            {
+              label: "Pause state",
+              value: contract.paused ? (
+                <span style={{ color: dark ? "#FCA5A5" : "#DC2626", fontWeight: 700 }}>
+                  ⏸ PAUSED
+                </span>
+              ) : (
+                <span style={{ color: dark ? "#86EFAC" : "#16A34A" }}>▶ Active</span>
+              ),
+            },
+            {
               label: "Schema version",
               value: (
                 <span>
@@ -300,6 +355,49 @@ function DrillDownPanel({ contract, viewerRole, dark, onClose, panelId, locale }
           {contract.pendingMultisig.map((action) => (
             <MultisigRow key={action.actionId} action={action} viewerRole={viewerRole} dark={dark} />
           ))}
+        </div>
+      )}
+
+      {/* Deprecated contract history */}
+      {contract.deprecatedContracts && contract.deprecatedContracts.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+            Deprecated Contract History
+          </div>
+          <div
+            style={{
+              background: rowBg,
+              border: `1px solid ${border}`,
+              borderRadius: 6,
+              overflow: "hidden",
+            }}
+          >
+            {contract.deprecatedContracts.map((dep, i) => (
+              <div
+                key={`${dep.contractId}-${i}`}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr auto",
+                  gap: 8,
+                  padding: "7px 10px",
+                  borderBottom:
+                    i < contract.deprecatedContracts!.length - 1
+                      ? `1px solid ${border}`
+                      : undefined,
+                  fontSize: 12,
+                }}
+              >
+                <span style={{ color: textPrimary, fontFamily: "monospace" }}>
+                  <span title={dep.contractId}>{shortContractId(dep.contractId)}</span>
+                  {dep.alias ? <span style={{ color: textMuted, fontFamily: "inherit" }}> — {dep.alias}</span> : null}
+                  {dep.reason ? <span style={{ color: textMuted, fontFamily: "inherit" }}> ({dep.reason})</span> : null}
+                </span>
+                <span style={{ color: textMuted, fontFamily: "monospace", whiteSpace: "nowrap" }}>
+                  {dep.deprecatedAtLedger !== undefined ? `ledger ${dep.deprecatedAtLedger.toLocaleString()}` : ""}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -368,6 +466,23 @@ function ContractTile({ contract, viewerRole, dark, locale }: ContractTileProps)
         <div style={{ textAlign: "start" }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: tk.text, whiteSpace: "nowrap" }}>{contract.name}</div>
           <div style={{ fontSize: 10, color: tk.text, opacity: 0.75, fontWeight: 500 }}>{statusLabel(contract.status)}</div>
+        <div style={{ textAlign: "left" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: tk.text, whiteSpace: "nowrap" }}>
+            {contract.name}
+            {contract.paused && (
+              <span
+                aria-label="paused"
+                title="Contract paused"
+                style={{ marginLeft: 5, fontSize: 10 }}
+              >
+                ⏸
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: 10, color: tk.text, opacity: 0.75, fontWeight: 500 }}>
+            {statusLabel(contract.status)}
+            {contract.contractId ? ` · ${shortContractId(contract.contractId)}` : ""}
+          </div>
         </div>
       </button>
 
@@ -382,14 +497,34 @@ function ContractTile({ contract, viewerRole, dark, locale }: ContractTileProps)
 // ContractHealthMatrix
 // ---------------------------------------------------------------------------
 
+const CONTRACT_ORDER: ContractName[] = ["Payment", "Escrow", "Refund", "Admin"];
+
 export function ContractHealthMatrix({
   contracts,
   viewerRole = "signer",
   lastSyncAgo,
   locale = typeof navigator !== "undefined" ? navigator.language : "en-US",
+  syncing = false,
+  backoffMs = 0,
+  rpcError = null,
 }: ContractHealthMatrixProps) {
   const dark = usePrefersDark();
   const textMuted = dark ? "#9CA3AF" : "#6B7280";
+  const degraded = backoffMs > 0 || !!rpcError;
+
+  // Ensure all four contracts render, even if the poller has not yet
+  // returned data for one of them (e.g. first tick / partial RPC failure).
+  const byName = new Map<ContractName, ContractHealth>();
+  for (const c of contracts) byName.set(c.name, c);
+  const ordered: ContractHealth[] = CONTRACT_ORDER.map(
+    (name) =>
+      byName.get(name) ?? {
+        name,
+        status: "unknown" as HealthStatus,
+        schemaVersion: "—",
+        schemaExpected: "—",
+      }
+  );
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
@@ -402,6 +537,53 @@ export function ContractHealthMatrix({
           Last sync: {lastSyncAgo}
         </span>
       )}
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        flexWrap: "wrap",
+      }}
+    >
+      <span style={{ fontSize: 12, fontWeight: 600, color: textMuted, whiteSpace: "nowrap" }}>
+        System Health
+      </span>
+      {ordered.map((c) => (
+        <ContractTile key={c.name} contract={c} viewerRole={viewerRole} dark={dark} />
+      ))}
+      <span
+        style={{
+          fontSize: 11,
+          color: degraded ? (dark ? "#FCA5A5" : "#DC2626") : textMuted,
+          marginLeft: "auto",
+          whiteSpace: "nowrap",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+        role="status"
+        aria-live="polite"
+      >
+        {syncing && (
+          <span
+            aria-hidden="true"
+            style={{
+              display: "inline-block",
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              border: `2px solid ${degraded ? (dark ? "#FCA5A5" : "#DC2626") : textMuted}`,
+              borderTopColor: "transparent",
+              animation: "dotPulse 1s linear infinite",
+            }}
+          />
+        )}
+        {degraded
+          ? `RPC degraded${backoffMs > 0 ? ` — retrying in ${Math.round(backoffMs / 1000)}s` : ""}`
+          : lastSyncAgo
+          ? `Last sync: ${lastSyncAgo}`
+          : null}
+      </span>
     </div>
   );
 }
@@ -412,6 +594,14 @@ export function ContractHealthMatrix({
 
 export function AdminHeader({
   network, contracts, viewerRole = "signer", lastSyncAgo, onEmergencyPauseClick, locale,
+  network,
+  contracts,
+  viewerRole = "signer",
+  lastSyncAgo,
+  onEmergencyPauseClick,
+  syncing = false,
+  backoffMs = 0,
+  rpcError = null,
 }: AdminHeaderProps) {
   const dark = usePrefersDark();
   const isAuditor = viewerRole === "auditor";
@@ -435,6 +625,14 @@ export function AdminHeader({
 
         <div style={{ flex: 1 }}>
           <ContractHealthMatrix contracts={contracts} viewerRole={viewerRole} lastSyncAgo={lastSyncAgo} locale={locale} />
+          <ContractHealthMatrix
+            contracts={contracts}
+            viewerRole={viewerRole}
+            lastSyncAgo={lastSyncAgo}
+            syncing={syncing}
+            backoffMs={backoffMs}
+            rpcError={rpcError}
+          />
         </div>
 
         <span style={{ position: "relative", flexShrink: 0 }}

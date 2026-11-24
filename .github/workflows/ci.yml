@@ -34,6 +34,32 @@ jobs:
         run: npm test
         working-directory: services/relayer
 
+  web:
+    name: Merchant Web (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: apps/web
+
+      - name: Typecheck web utilities and pages
+        run: npm run typecheck
+        working-directory: apps/web
+
+      - name: Test forwarding loop detection and StrKey validation
+        run: npm test
+        working-directory: apps/web
+
   matrix-test:
     name: Matrix Test (${{ matrix.os }} - Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}

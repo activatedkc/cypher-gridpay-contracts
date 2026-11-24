@@ -61,6 +61,38 @@ export interface EmergencyPauseModalProps
   network: Network;
   pauseScope: "all" | "escrow" | "payments" | "refunds";
   countdownSeconds?: number;
+  /**
+   * Whether this modal is pausing or unpausing. Defaults to "pause".
+   * Drives the confirmation phrase and the action label.
+   */
+  action?: "pause" | "unpause";
+  /**
+   * Contract alias the operator must re-type as part of the high-contrast
+   * confirmation barrier (e.g. "orchestrator", "payment", "escrow").
+   * Defaults to the pause scope when not supplied.
+   */
+  contractAlias?: string;
+  /**
+   * Structured incident reason. When provided, the modal renders a
+   * two-step flow: (1) incident reason + post-mortem attestation hash,
+   * (2) network/alias confirmation barrier before signing.
+   */
+  incidentReason?: string;
+  /** 64-char lowercase hex post-mortem attestation hash. */
+  postMortemAttestationHash?: string;
+  /** Called with the collected structured incident payload on confirm. */
+  onConfirmWithIncident?: (payload: EmergencyIncidentPayload) => void;
+}
+
+/** Structured incident payload collected by the two-step emergency flow. */
+export interface EmergencyIncidentPayload {
+  action: "pause" | "unpause";
+  network: Network;
+  pauseScope: EmergencyPauseModalProps["pauseScope"];
+  contractAlias: string;
+  incidentReason: string;
+  postMortemAttestationHash: string;
+  justification: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +570,11 @@ export function HighImpactActionModal({
 // EmergencyPauseModal
 // ---------------------------------------------------------------------------
 
-function pausePhrase(scope: EmergencyPauseModalProps["pauseScope"], network: Network): string {
+function pausePhrase(
+  scope: EmergencyPauseModalProps["pauseScope"],
+  network: Network,
+  action: "pause" | "unpause" = "pause"
+): string {
   const net = network === "mainnet" ? "MAINNET" : network === "testnet" ? "TESTNET" : "LOCALNET";
   return scope === "all" ? `PAUSE ${net}` : `PAUSE ${scope.toUpperCase()}`;
 }
@@ -547,28 +583,99 @@ export function EmergencyPauseModal({
   open, title = "Emergency Pause", diff, signerAddress, multisigDescription,
   viewerRole = "signer", network, pauseScope, wasmChecksumExpected, wasmChecksumVerified,
   countdownSeconds = 5, onConfirm, onCancel,
+  const verb = action === "unpause" ? "UNPAUSE" : "PAUSE";
+  if (scope === "all") return `${verb} ${net}`;
+  return `${verb} ${scope.toUpperCase()}`;
+}
+
+/** Network name the operator must re-type in the confirmation barrier. */
+export function networkConfirmationName(network: Network): string {
+  return network === "mainnet" ? "MAINNET" : network === "testnet" ? "TESTNET" : "LOCALNET";
+}
+
+/** Returns true when `input` is a valid 64-char lowercase hex SHA-256. */
+export function isValidAttestationHash(input: string): boolean {
+  return /^[0-9a-f]{64}$/.test(input);
+}
+
+/**
+ * Evaluates the high-contrast confirmation barrier. Both the network name and
+ * the contract alias must be re-typed exactly (case-sensitive) before the
+ * operator is allowed to sign a high-stakes transaction.
+ */
+export function isConfirmationBarrierSatisfied(params: {
+  networkInput: string;
+  aliasInput: string;
+  network: Network;
+  contractAlias: string;
+}): boolean {
+  return (
+    params.networkInput === networkConfirmationName(params.network) &&
+    params.aliasInput === params.contractAlias
+  );
+}
+
+export function EmergencyPauseModal({
+  open,
+  title = "Emergency Pause",
+  diff,
+  signerAddress,
+  multisigDescription,
+  viewerRole = "signer",
+  network,
+  pauseScope,
+  wasmChecksumExpected,
+  wasmChecksumVerified,
+  countdownSeconds = 5,
+  action = "pause",
+  contractAlias,
+  incidentReason: initialIncidentReason,
+  postMortemAttestationHash: initialAttestationHash,
+  onConfirm,
+  onConfirmWithIncident,
+  onCancel,
 }: EmergencyPauseModalProps) {
   const dark = usePrefersDark();
   const modalRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const disabledReasonId = useId();
   const phraseDescId = useId();
+  const barrierDescId = useId();
 
   const [phraseInput, setPhraseInput] = useState("");
   const [justification, setJustification] = useState("");
   const [countingDown, setCountingDown] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(countdownSeconds);
 
+  // Two-step emergency flow state
+  const [step, setStep] = useState<1 | 2>(1);
+  const [incidentReason, setIncidentReason] = useState(initialIncidentReason ?? "");
+  const [attestationHash, setAttestationHash] = useState(initialAttestationHash ?? "");
+  const [networkInput, setNetworkInput] = useState("");
+  const [aliasInput, setAliasInput] = useState("");
+
   const textPrimary = dark ? "#F9FAFB" : "#111827";
   const textMuted = dark ? "#9CA3AF" : "#6B7280";
   const border = dark ? "#374151" : "#E5E7EB";
   const inputBg = dark ? "#111827" : "#F9FAFB";
 
-  const confirmationPhrase = pausePhrase(pauseScope, network);
+  const resolvedAlias =
+    contractAlias ?? (pauseScope === "all" ? "orchestrator" : pauseScope);
+  const confirmationPhrase = pausePhrase(pauseScope, network, action);
   const checksumOk = !wasmChecksumExpected || wasmChecksumVerified === true;
   const phraseOk = phraseInput === confirmationPhrase;
   const justificationOk = justification.trim().length >= 20;
-  const allGuardsPassed = checksumOk && phraseOk && justificationOk;
+  const incidentReasonOk = incidentReason.trim().length >= 20;
+  const attestationOk = isValidAttestationHash(attestationHash);
+  const barrierOk = isConfirmationBarrierSatisfied({
+    networkInput,
+    aliasInput,
+    network,
+    contractAlias: resolvedAlias,
+  });
+  const step1Ok = incidentReasonOk && attestationOk;
+  const allGuardsPassed =
+    checksumOk && phraseOk && justificationOk && step1Ok && barrierOk;
 
   useFocusTrap(modalRef, open);
   useEscapeKey(() => {
@@ -579,19 +686,61 @@ export function EmergencyPauseModal({
   useEffect(() => {
     if (!countingDown) return;
     if (secondsLeft <= 0) { setCountingDown(false); onConfirm(); return; }
+    if (secondsLeft <= 0) {
+      setCountingDown(false);
+      handleFinalConfirm();
+      return;
+    }
     const t = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
     return () => clearTimeout(t);
-  }, [countingDown, secondsLeft, onConfirm]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [countingDown, secondsLeft]);
+
+  function buildIncidentPayload(): EmergencyIncidentPayload {
+    return {
+      action,
+      network,
+      pauseScope,
+      contractAlias: resolvedAlias,
+      incidentReason: incidentReason.trim(),
+      postMortemAttestationHash: attestationHash,
+      justification: justification.trim(),
+    };
+  }
 
   function handleInitiateCountdown() { setSecondsLeft(countdownSeconds); setCountingDown(true); }
   function handleAbort() { setCountingDown(false); setSecondsLeft(countdownSeconds); }
+  function handleInitiateCountdown() {
+    setSecondsLeft(countdownSeconds);
+    setCountingDown(true);
+  }
+
+  function handleFinalConfirm() {
+    if (onConfirmWithIncident) onConfirmWithIncident(buildIncidentPayload());
+    onConfirm();
+  }
+
+  function handleAbort() {
+    setCountingDown(false);
+    setSecondsLeft(countdownSeconds);
+  }
 
   if (!open) return null;
 
   const scopeLabel = pauseScope === "all" ? "All Contracts" : pauseScope.charAt(0).toUpperCase() + pauseScope.slice(1);
+  const actionLabel = action === "unpause" ? "Emergency Unpause" : "Emergency Pause";
+  const networkName = networkConfirmationName(network);
 
   return (
     <ModalShell titleId={titleId} title={`Emergency Pause — ${scopeLabel}`} tier="emergency-pause" dark={dark} onClose={countingDown ? handleAbort : onCancel} modalRef={modalRef}>
+    <ModalShell
+      titleId={titleId}
+      title={`${actionLabel} — ${scopeLabel}`}
+      tier="emergency-pause"
+      dark={dark}
+      onClose={countingDown ? handleAbort : onCancel}
+      modalRef={modalRef}
+    >
       {/* Countdown overlay */}
       {countingDown && (
         <div aria-live="assertive" aria-atomic="true" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", paddingBlock: 24, gap: 16 }}>
@@ -599,7 +748,7 @@ export function EmergencyPauseModal({
             {secondsLeft}
           </div>
           <p style={{ margin: 0, fontSize: 14, color: textPrimary, fontWeight: 600 }}>
-            Submitting pause transaction in {secondsLeft} second{secondsLeft !== 1 ? "s" : ""}…
+            Submitting {action} transaction in {secondsLeft} second{secondsLeft !== 1 ? "s" : ""}…
           </p>
           <p style={{ margin: 0, fontSize: 12, color: textMuted }}>Press Abort or Escape to cancel.</p>
           <button type="button" onClick={handleAbort} autoFocus
@@ -614,10 +763,270 @@ export function EmergencyPauseModal({
           {network === "mainnet" && (
             <div role="alert" style={{ marginBlockEnd: 14, paddingBlock: 10, paddingInline: 14, background: dark ? "#450A0A" : "#FEF2F2", border: `1px solid ${dark ? "#F87171" : "#EF4444"}`, borderRadius: 6, fontSize: 13, color: dark ? "#FEE2E2" : "#7F1D1D", fontWeight: 600 }}>
               ⚠ You are about to pause {scopeLabel} on MAINNET. This will halt all affected transactions until manually resumed.
+            <div
+              role="alert"
+              style={{
+                marginBottom: 14,
+                padding: "10px 14px",
+                background: dark ? "#450A0A" : "#FEF2F2",
+                border: `1px solid ${dark ? "#F87171" : "#EF4444"}`,
+                borderRadius: 6,
+                fontSize: 13,
+                color: dark ? "#FEE2E2" : "#7F1D1D",
+                fontWeight: 600,
+              }}
+            >
+              ⚠ You are about to {action} {scopeLabel} on MAINNET.{" "}
+              {action === "pause"
+                ? "This will halt all affected transactions until manually resumed."
+                : "This will resume processing of all affected transactions."}
             </div>
           )}
 
+          {/* Step indicator */}
+          <div
+            role="list"
+            aria-label="Emergency action steps"
+            style={{
+              display: "flex",
+              gap: 8,
+              marginBottom: 16,
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+            }}
+          >
+            {[
+              { n: 1 as const, label: "Incident Attestation" },
+              { n: 2 as const, label: "Confirmation Barrier" },
+            ].map(({ n, label }) => {
+              const active = step === n;
+              const done = step > n;
+              return (
+                <div
+                  key={n}
+                  role="listitem"
+                  aria-current={active ? "step" : undefined}
+                  style={{
+                    flex: 1,
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: `1px solid ${active ? (dark ? "#F87171" : "#EF4444") : border}`,
+                    background: active
+                      ? dark ? "#450A0A" : "#FEF2F2"
+                      : done
+                      ? dark ? "#14532D" : "#DCFCE7"
+                      : "transparent",
+                    color: active
+                      ? dark ? "#FCA5A5" : "#7F1D1D"
+                      : done
+                      ? dark ? "#86EFAC" : "#166534"
+                      : textMuted,
+                  }}
+                >
+                  {done ? "✓ " : `${n}. `}
+                  {label}
+                </div>
+              );
+            })}
+          </div>
+
           <DiffTable diff={diff} dark={dark} />
+
+          {/* Step 1: structured incident reason + post-mortem attestation hash */}
+          {step === 1 && (
+            <>
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: textMuted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  Structured Incident Reason (required)
+                </div>
+                <textarea
+                  aria-label="Structured incident reason"
+                  value={incidentReason}
+                  onChange={(e) => setIncidentReason(e.target.value)}
+                  rows={3}
+                  placeholder="Describe the incident: affected subsystem, observed impact, detection source…"
+                  style={{
+                    width: "100%",
+                    padding: "9px 12px",
+                    background: inputBg,
+                    border: `1px solid ${incidentReason.trim().length > 0 && !incidentReasonOk ? "#EAB308" : incidentReasonOk ? "#22C55E" : border}`,
+                    borderRadius: 6,
+                    fontSize: 13,
+                    color: textPrimary,
+                    resize: "vertical",
+                    boxSizing: "border-box",
+                    outline: "none",
+                  }}
+                />
+                <div style={{ textAlign: "right", fontSize: 11, color: textMuted, marginTop: 3 }}>
+                  {incidentReason.trim().length} / 20 min characters
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: textMuted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  Post-Mortem Attestation Hash (required)
+                </div>
+                <p style={{ margin: "0 0 6px", fontSize: 11, color: textMuted }}>
+                  SHA-256 of the signed post-mortem / incident attestation (64-char lowercase hex).
+                </p>
+                <input
+                  type="text"
+                  aria-label="Post-mortem attestation hash"
+                  value={attestationHash}
+                  onChange={(e) => setAttestationHash(e.target.value.trim())}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  placeholder="e.g. 3f9a… (64 hex chars)"
+                  style={{
+                    width: "100%",
+                    padding: "9px 12px",
+                    background: inputBg,
+                    border: `1px solid ${attestationHash && !attestationOk ? "#EF4444" : attestationOk ? "#22C55E" : border}`,
+                    borderRadius: 6,
+                    fontSize: 13,
+                    fontFamily: "monospace",
+                    color: textPrimary,
+                    outline: "none",
+                    boxSizing: "border-box",
+                  }}
+                />
+                {attestationHash && !attestationOk && (
+                  <div role="alert" style={{ marginTop: 4, fontSize: 11, color: dark ? "#FCA5A5" : "#DC2626" }}>
+                    Invalid hash — must be exactly 64 lowercase hex characters.
+                  </div>
+                )}
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  type="button"
+                  disabled={!step1Ok}
+                  aria-disabled={!step1Ok}
+                  onClick={() => setStep(2)}
+                  style={{
+                    padding: "9px 20px",
+                    background: step1Ok ? (dark ? "#1D4ED8" : "#2563EB") : (dark ? "#374151" : "#D1D5DB"),
+                    color: step1Ok ? "#FFFFFF" : (dark ? "#6B7280" : "#9CA3AF"),
+                    border: "none",
+                    borderRadius: 6,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: step1Ok ? "pointer" : "not-allowed",
+                    opacity: step1Ok ? 1 : 0.6,
+                  }}
+                >
+                  Continue to Confirmation →
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Step 2: high-contrast confirmation barrier */}
+          {step === 2 && (
+            <div
+              role="group"
+              aria-labelledby={barrierDescId}
+              style={{
+                marginBottom: 20,
+                padding: "14px 16px",
+                border: `2px solid ${dark ? "#F87171" : "#DC2626"}`,
+                borderRadius: 8,
+                background: dark ? "#450A0A" : "#FEF2F2",
+              }}
+            >
+              <div
+                id={barrierDescId}
+                style={{
+                  fontSize: 12,
+                  fontWeight: 800,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  color: dark ? "#FCA5A5" : "#7F1D1D",
+                  marginBottom: 10,
+                }}
+              >
+                ⚠ High-Contrast Confirmation Barrier
+              </div>
+              <p style={{ margin: "0 0 10px", fontSize: 12, color: dark ? "#FEE2E2" : "#7F1D1D" }}>
+                Re-type the target network name and contract alias exactly to unlock signing.
+              </p>
+
+              <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Network name (type <code style={{ fontFamily: "monospace" }}>{networkName}</code>)
+              </label>
+              <input
+                type="text"
+                aria-label="Re-type target network name"
+                value={networkInput}
+                onChange={(e) => setNetworkInput(e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                placeholder={networkName}
+                style={{
+                  width: "100%",
+                  marginBottom: 10,
+                  padding: "9px 12px",
+                  background: inputBg,
+                  border: `1px solid ${networkInput && networkInput !== networkName ? "#EF4444" : networkInput === networkName ? "#22C55E" : border}`,
+                  borderRadius: 6,
+                  fontSize: 13,
+                  fontFamily: "monospace",
+                  letterSpacing: "0.08em",
+                  color: textPrimary,
+                  outline: "none",
+                  boxSizing: "border-box",
+                }}
+              />
+
+              <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Contract alias (type <code style={{ fontFamily: "monospace" }}>{resolvedAlias}</code>)
+              </label>
+              <input
+                type="text"
+                aria-label="Re-type contract alias"
+                value={aliasInput}
+                onChange={(e) => setAliasInput(e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                placeholder={resolvedAlias}
+                style={{
+                  width: "100%",
+                  padding: "9px 12px",
+                  background: inputBg,
+                  border: `1px solid ${aliasInput && aliasInput !== resolvedAlias ? "#EF4444" : aliasInput === resolvedAlias ? "#22C55E" : border}`,
+                  borderRadius: 6,
+                  fontSize: 13,
+                  fontFamily: "monospace",
+                  color: textPrimary,
+                  outline: "none",
+                  boxSizing: "border-box",
+                }}
+              />
+
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                style={{
+                  marginTop: 10,
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  cursor: "pointer",
+                  fontSize: 12,
+                  color: dark ? "#93C5FD" : "#2563EB",
+                  textDecoration: "underline",
+                }}
+              >
+                ← Back to incident attestation
+              </button>
+            </div>
+          )}
 
           {/* Typed phrase */}
           <div style={{ marginBlockEnd: 16 }}>
@@ -666,6 +1075,14 @@ export function EmergencyPauseModal({
             <ConfirmButton disabled={!allGuardsPassed} viewerRole={viewerRole}
               label={`Execute Pause${network === "mainnet" && pauseScope === "all" ? " (5s countdown)" : ""} →`}
               dark={dark} onClick={network === "mainnet" ? handleInitiateCountdown : onConfirm} disabledReasonId={disabledReasonId} />
+            <ConfirmButton
+              disabled={!allGuardsPassed || step !== 2}
+              viewerRole={viewerRole}
+              label={`Execute ${action === "unpause" ? "Unpause" : "Pause"}${network === "mainnet" && pauseScope === "all" ? " (5s countdown)" : ""} →`}
+              dark={dark}
+              onClick={network === "mainnet" ? handleInitiateCountdown : handleFinalConfirm}
+              disabledReasonId={disabledReasonId}
+            />
           </div>
         </>
       )}

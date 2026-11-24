@@ -19,6 +19,29 @@ import React, {
   useState,
 } from "react";
 
+import {
+  analyzeForwardGraph,
+  DEFAULT_MAX_FORWARD_DEPTH,
+  type ForwardAnalysis,
+  type ForwardEdge,
+} from "../../utils/forwardingLoopDetector.js";
+import {
+  calculateSettlement,
+  formatStroops,
+  usdcToStroops,
+} from "../../utils/settlement.js";
+import {
+  findDuplicateAddresses,
+  isValidStellarAddress,
+} from "../../utils/stellarAddress.js";
+import {
+  downloadSplitPreset,
+  parseSplitPreset,
+  serializeSplitPreset,
+  SPLIT_PRESET_SCHEMA,
+  type SplitPreset,
+} from "../../utils/splitPresets.js";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -27,6 +50,8 @@ const TOTAL_BPS = 10_000;
 const EXAMPLE_AMOUNT_USDC = 100;
 const DEFAULT_MAX_RECIPIENTS = 10;
 const DEFAULT_PROTOCOL_FEE_BPS = 50;
+const DEFAULT_PROTOCOL_FEE_BPS = 50; // 0.50 %
+const EMPTY_FORWARD_CONFIGS: ForwardEdge[] = [];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +68,8 @@ export interface SplitRecipient {
 
 export interface ForwardingRule {
   id: string;
+  id: string; // local UI key only
+  merchant: string;
   forward_to: string;
   forward_bps: number;
   active: boolean;
@@ -52,6 +79,15 @@ export interface SplitAllocationEditorProps {
   merchantAddress: string;
   maxRecipients?: number;
   protocolFeeBps?: number;
+  /** Existing on-chain PaymentForwardConfig entries from get_forward_config. */
+  externalForwardConfigs?: ForwardEdge[];
+  /** Number of scheduled payouts that would be affected by forwarding changes. */
+  pendingPayoutCount?: number;
+  /** Contract MaxForwardDepth; defaults to 5. */
+  maxForwardDepth?: number;
+  /** Called after a preset has been imported and validated. */
+  onPresetApplied?: (preset: SplitPreset) => void;
+  /** Called when the user confirms a valid configuration. */
   onSave?: (config: {
     recipients: Array<{ address: string; share_bps: number }>;
     forwardingRules: Array<{ merchant: string; forward_to: string; forward_bps: number; active: boolean }>;
@@ -81,6 +117,7 @@ function detectForwardingCycle(rules: ForwardingRule[], _recipients: SplitRecipi
   return null;
 }
 
+/** Splits 10 000 bps evenly; remainder goes to dustSinkIndex (or last row). */
 function splitEvenly(count: number, dustSinkIndex: number): number[] {
   if (count === 0) return [];
   const base = Math.floor(TOTAL_BPS / count);
@@ -107,10 +144,12 @@ type EditorAction =
   | { type: "UPDATE_BPS"; id: string; bps: number }
   | { type: "SET_DUST_SINK"; id: string }
   | { type: "SPLIT_EVENLY" }
+  | { type: "AUTO_BALANCE" }
   | { type: "FILL_REMAINING"; id: string }
   | { type: "MOVE_ROW"; id: string; direction: "up" | "down" }
   | { type: "RESET" }
-  | { type: "ADD_FORWARD_RULE" }
+  | { type: "LOAD_PRESET"; preset: SplitPreset }
+  | { type: "ADD_FORWARD_RULE"; merchant: string }
   | { type: "REMOVE_FORWARD_RULE"; id: string }
   | { type: "UPDATE_FORWARD_RULE"; id: string; patch: Partial<ForwardingRule> };
 
@@ -119,6 +158,15 @@ function initialRecipient(overrides?: Partial<SplitRecipient>): SplitRecipient {
 }
 function initialForwardingRule(): ForwardingRule {
   return { id: uid(), forward_to: "", forward_bps: 0, active: true };
+
+function initialForwardingRule(merchant: string): ForwardingRule {
+  return {
+    id: uid(),
+    merchant,
+    forward_to: "",
+    forward_bps: 0,
+    active: true,
+  };
 }
 
 const initialState: EditorState = {
@@ -145,6 +193,33 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
       const bpsValues = splitEvenly(state.recipients.length, sinkIdx);
       return { ...state, recipients: state.recipients.map((r, i) => ({ ...r, share_bps: bpsValues[i] })) };
     }
+
+    case "AUTO_BALANCE": {
+      if (state.recipients.length === 0) return state;
+      const sinkIdx = state.recipients.findIndex((r) => r.isDustSink);
+      const effectiveSink = sinkIdx >= 0 ? sinkIdx : state.recipients.length - 1;
+      const sumOthers = (rows: SplitRecipient[]) =>
+        rows.reduce(
+          (sum, r, i) => (i === effectiveSink ? sum : sum + r.share_bps),
+          0
+        );
+
+      let rows = state.recipients.map((r) => ({ ...r }));
+      let excess = sumOthers(rows) - TOTAL_BPS;
+      for (let i = 0; i < rows.length && excess > 0; i += 1) {
+        if (i === effectiveSink) continue;
+        const reduction = Math.min(rows[i].share_bps, excess);
+        rows[i] = { ...rows[i], share_bps: rows[i].share_bps - reduction };
+        excess -= reduction;
+      }
+
+      rows[effectiveSink] = {
+        ...rows[effectiveSink],
+        share_bps: TOTAL_BPS - sumOthers(rows),
+      };
+      return { ...state, recipients: rows };
+    }
+
     case "FILL_REMAINING": {
       const others = state.recipients.filter((r) => r.id !== action.id).reduce((s, r) => s + r.share_bps, 0);
       const fill = TOTAL_BPS - others;
@@ -165,6 +240,58 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
     case "REMOVE_FORWARD_RULE": return { ...state, forwardingRules: state.forwardingRules.filter((r) => r.id !== action.id) };
     case "UPDATE_FORWARD_RULE": return { ...state, forwardingRules: state.forwardingRules.map((r) => r.id === action.id ? { ...r, ...action.patch } : r) };
     default: return state;
+
+    case "RESET":
+      return {
+        ...initialState,
+        recipients: [initialRecipient({ share_bps: TOTAL_BPS, isDustSink: true })],
+      };
+
+    case "LOAD_PRESET": {
+      const hasSink = action.preset.recipients.some((r) => r.isDustSink);
+      const recipients = action.preset.recipients.map((r, i) => ({
+        id: uid(),
+        address: r.address,
+        share_bps: r.share_bps,
+        isDustSink: Boolean(r.isDustSink) || (!hasSink && i === action.preset.recipients.length - 1),
+      }));
+      const forwardingRules = action.preset.forwardingRules.map((r) => ({
+        id: uid(),
+        merchant: action.preset.merchantAddress ?? "",
+        forward_to: r.forward_to,
+        forward_bps: r.forward_bps,
+        active: r.active,
+      }));
+      return { ...state, recipients, forwardingRules };
+    }
+
+    case "ADD_FORWARD_RULE":
+      return {
+        ...state,
+        forwardingRules: [
+          ...state.forwardingRules,
+          initialForwardingRule(action.merchant),
+        ],
+      };
+
+    case "REMOVE_FORWARD_RULE":
+      return {
+        ...state,
+        forwardingRules: state.forwardingRules.filter(
+          (r) => r.id !== action.id
+        ),
+      };
+
+    case "UPDATE_FORWARD_RULE":
+      return {
+        ...state,
+        forwardingRules: state.forwardingRules.map((r) =>
+          r.id === action.id ? { ...r, ...action.patch } : r
+        ),
+      };
+
+    default:
+      return state;
   }
 }
 
@@ -292,6 +419,16 @@ interface ForwardingRuleRowProps {
 
 function ForwardingRuleRow({ rule, inputMode, onChange, onRemove }: ForwardingRuleRowProps) {
   const isInvalid = rule.forward_to.trim() !== "" && !isValidStellarAddress(rule.forward_to);
+function ForwardingRuleRow({
+  rule,
+  inputMode,
+  onChange,
+  onRemove,
+}: ForwardingRuleRowProps) {
+  const isInvalid =
+    rule.forward_to.trim() !== "" && !isValidStellarAddress(rule.forward_to);
+  const isMerchantInvalid =
+    rule.merchant.trim() !== "" && !isValidStellarAddress(rule.merchant);
   const isZeroBps = rule.forward_bps === 0;
   const displayBps = inputMode === "pct" ? bpsToPct(rule.forward_bps).toFixed(2) : String(rule.forward_bps);
 
@@ -311,6 +448,46 @@ function ForwardingRuleRow({ rule, inputMode, onChange, onRemove }: ForwardingRu
       <div>
         <input type="text" dir="ltr" aria-label="Forward-to Stellar address"
           placeholder="Forward-to G… or C…" value={rule.forward_to}
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 160px 60px auto",
+        gap: 8,
+        alignItems: "center",
+        padding: "8px 0",
+        borderBottom: "1px solid #f3f4f6",
+      }}
+    >
+      <div>
+        <input
+          type="text"
+          aria-label="Forwarding source merchant address"
+          placeholder="From G… or C…"
+          value={rule.merchant}
+          onChange={(e) => onChange(rule.id, { merchant: e.target.value })}
+          style={{
+            width: "100%",
+            padding: "6px 8px",
+            border: `1px solid ${isMerchantInvalid ? "#ef4444" : "#d1d5db"}`,
+            borderRadius: 4,
+            fontSize: 13,
+            fontFamily: "monospace",
+            boxSizing: "border-box",
+          }}
+        />
+        {isMerchantInvalid && (
+          <p role="alert" style={{ color: "#ef4444", fontSize: 11, margin: "2px 0 0" }}>
+            Invalid source address.
+          </p>
+        )}
+      </div>
+
+      <div>
+        <input
+          type="text"
+          aria-label="Forward-to Stellar address"
+          placeholder="Forward-to G… or C…"
+          value={rule.forward_to}
           onChange={(e) => onChange(rule.id, { forward_to: e.target.value })}
           style={{ width: "100%", paddingBlock: 6, paddingInline: 8, border: `1px solid ${isInvalid ? "#ef4444" : "#d1d5db"}`, borderRadius: 4, fontSize: 13, fontFamily: "monospace", boxSizing: "border-box" }} />
         {isInvalid && <p role="alert" style={{ color: "#ef4444", fontSize: 11, margin: "2px 0 0" }}>Invalid Stellar address.</p>}
@@ -351,6 +528,54 @@ function FlowPreview({ recipients, forwardingRules, protocolFeeBps, cycleAddress
   const NODE_W = 130; const NODE_H = 32;
   const customerX = 10; const feeX = 10; const recipientX = 230; const forwardX = 420;
   const customerY = 20; const feeY = customerY + 60; const recipientStartY = feeY + 20; const recipientGap = 52;
+interface FlowPreviewProps {
+  recipients: SplitRecipient[];
+  forwardingRules: ForwardingRule[];
+  protocolFeeBps: number;
+  forwardAnalysis: ForwardAnalysis;
+}
+
+function FlowPreview({
+  recipients,
+  forwardingRules,
+  protocolFeeBps,
+  forwardAnalysis,
+}: FlowPreviewProps) {
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
+  );
+  const highlighted = useMemo(
+    () => new Set(forwardAnalysis.highlightedAddresses),
+    [forwardAnalysis]
+  );
+  const protocolFeeUsdc = formatStroops(settlement.protocolFeeStroops);
+
+  const NODE_W = 130;
+  const NODE_H = 32;
+
+  // Column x-positions
+  const customerX = 10;
+  const feeX = 10;
+  const recipientX = 230;
+  const forwardX = 420;
+
+  // Customer node at top
+  const customerY = 20;
+  // Fee node below customer
+  const feeY = customerY + 60;
+  // Recipients spread vertically
+  const recipientStartY = feeY + 20;
+  const recipientGap = 52;
+
+  const chainStartY = recipientStartY + recipients.length * recipientGap + 8;
+  const W = 580;
+  const H = Math.max(200, chainStartY + forwardAnalysis.hopChains.length * 18 + 24);
 
   function truncAddr(addr: string) {
     if (!addr || addr.length < 10) return addr || "—";
@@ -385,6 +610,61 @@ function FlowPreview({ recipients, forwardingRules, protocolFeeBps, cycleAddress
               <text x={recipientX + 8} y={ry + 13} fontSize={10} fill="#166534" fontWeight="bold">{truncAddr(r.address)}{r.isDustSink ? " ★" : ""}</text>
               <text x={recipientX + 8} y={ry + 25} fontSize={10} fill="#166534">{r.share_bps} bps · {shareUsdc} USDC</text>
               {isCyclic && <text x={recipientX + NODE_W - 40} y={ry + 20} fontSize={10} fill="#ef4444" fontWeight="bold">⚠ LOOP</text>}
+        const shareUsdc = formatStroops(settlement.payouts[i]?.netStroops ?? 0n);
+        const isProblem = highlighted.has(r.address.trim());
+
+        // Find the forwarding rule that originates from this recipient
+        const fwdRule = forwardingRules.find(
+          (f) =>
+            f.active &&
+            f.merchant.trim() === r.address.trim() &&
+            f.forward_to.trim() !== "" &&
+            f.forward_to.trim() !== r.address.trim()
+        );
+        const hopProblem = Boolean(
+          fwdRule && highlighted.has(fwdRule.forward_to.trim())
+        );
+
+        return (
+          <g key={r.id}>
+            {/* Line from fee node to recipient */}
+            <line
+              x1={feeX + NODE_W}
+              y1={feeY + NODE_H / 2}
+              x2={recipientX}
+              y2={ry + NODE_H / 2}
+              stroke={isProblem ? "#ef4444" : "#94a3b8"}
+              strokeWidth={Math.max(1, (r.share_bps / TOTAL_BPS) * 8)}
+              strokeDasharray={isProblem ? "4 2" : undefined}
+              markerEnd="url(#arrow)"
+            />
+
+            {/* Recipient node */}
+            <g
+              tabIndex={0}
+              aria-label={`Recipient ${truncAddr(r.address)}: ${bpsToPct(r.share_bps).toFixed(2)}%, ${shareUsdc} USDC${r.isDustSink ? ", dust-sink" : ""}`}
+            >
+              <rect
+                x={recipientX}
+                y={ry}
+                width={NODE_W}
+                height={NODE_H}
+                rx={4}
+                fill={isProblem ? "#fee2e2" : "#dcfce7"}
+                stroke={isProblem ? "#ef4444" : "#86efac"}
+              />
+              <text x={recipientX + 8} y={ry + 13} fontSize={10} fill="#166534" fontWeight="bold">
+                {truncAddr(r.address)}
+                {r.isDustSink ? " ★" : ""}
+              </text>
+              <text x={recipientX + 8} y={ry + 25} fontSize={10} fill="#166534">
+                {r.share_bps} bps · {shareUsdc} USDC
+              </text>
+              {isProblem && (
+                <text x={recipientX + NODE_W - 40} y={ry + 20} fontSize={10} fill="#ef4444" fontWeight="bold">
+                  ⚠ ISSUE
+                </text>
+              )}
             </g>
             {fwdRule && fwdRule.forward_to && (
               <>
@@ -393,12 +673,63 @@ function FlowPreview({ recipients, forwardingRules, protocolFeeBps, cycleAddress
                   <rect x={forwardX} y={ry} width={NODE_W - 10} height={NODE_H} rx={4} fill="#ede9fe" stroke="#a78bfa" />
                   <text x={forwardX + 6} y={ry + 13} fontSize={9} fill="#5b21b6" fontWeight="bold">→ {truncAddr(fwdRule.forward_to)}</text>
                   <text x={forwardX + 6} y={ry + 25} fontSize={9} fill="#5b21b6">{fwdRule.forward_bps} bps</text>
+                <line
+                  x1={recipientX + NODE_W}
+                  y1={ry + NODE_H / 2}
+                  x2={forwardX}
+                  y2={ry + NODE_H / 2}
+                  stroke={hopProblem ? "#ef4444" : "#a78bfa"}
+                  strokeWidth={1.5}
+                  strokeDasharray="4 2"
+                  markerEnd="url(#arrowPurple)"
+                />
+                <g tabIndex={0} aria-label={`Forward to ${truncAddr(fwdRule.forward_to)}: ${fwdRule.forward_bps} bps${hopProblem ? " (loop risk)" : ""}`}>
+                  <rect
+                    x={forwardX}
+                    y={ry}
+                    width={NODE_W - 10}
+                    height={NODE_H}
+                    rx={4}
+                    fill={hopProblem ? "#fee2e2" : "#ede9fe"}
+                    stroke={hopProblem ? "#ef4444" : "#a78bfa"}
+                  />
+                  <text x={forwardX + 6} y={ry + 13} fontSize={9} fill={hopProblem ? "#991b1b" : "#5b21b6"} fontWeight="bold">
+                    {hopProblem ? "⚠ " : "→ "}{truncAddr(fwdRule.forward_to)}
+                  </text>
+                  <text x={forwardX + 6} y={ry + 25} fontSize={9} fill={hopProblem ? "#991b1b" : "#5b21b6"}>
+                    {fwdRule.forward_bps} bps
+                  </text>
                 </g>
               </>
             )}
           </g>
         );
       })}
+
+      {/* Multi-hop forwarding chains */}
+      {forwardAnalysis.hopChains.map((chain, i) => {
+        const problem = chain.some((address) => highlighted.has(address));
+        return (
+          <g
+            key={`chain-${i}`}
+            tabIndex={0}
+            aria-label={`Forwarding chain: ${chain.join(" to ")}${problem ? " (invalid)" : ""}`}
+          >
+            <text
+              x={10}
+              y={chainStartY + i * 18}
+              fontSize={10}
+              fill={problem ? "#ef4444" : "#5b21b6"}
+              fontWeight={problem ? "bold" : "normal"}
+            >
+              {problem ? "⚠ " : "↳ "}
+              {chain.map(truncAddr).join(" → ")}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Arrow marker */}
       <defs>
         <marker id="arrow" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#94a3b8" /></marker>
         <marker id="arrowPurple" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#a78bfa" /></marker>
@@ -414,6 +745,22 @@ function FlowPreview({ recipients, forwardingRules, protocolFeeBps, cycleAddress
 function CompactTable({ recipients, protocolFeeBps }: { recipients: SplitRecipient[]; protocolFeeBps: number }) {
   const thStyle: React.CSSProperties = { paddingBlock: 6, paddingInline: 8, textAlign: "start", fontWeight: 600, borderBlockEnd: "2px solid #e5e7eb" };
   const tdStyle: React.CSSProperties = { paddingBlock: 5, paddingInline: 8, fontFamily: "monospace" };
+function CompactTable({
+  recipients,
+  protocolFeeBps,
+}: {
+  recipients: SplitRecipient[];
+  protocolFeeBps: number;
+}) {
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
+  );
   return (
     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
       <thead>
@@ -437,6 +784,11 @@ function CompactTable({ recipients, protocolFeeBps }: { recipients: SplitRecipie
             <td style={tdStyle}><span dir="ltr" style={{ unicodeBidi: "isolate" }}>{r.share_bps}</span></td>
             <td style={tdStyle}><span dir="ltr" style={{ unicodeBidi: "isolate" }}>{bpsToPct(r.share_bps).toFixed(2)}%</span></td>
             <td style={tdStyle}><span dir="ltr" style={{ unicodeBidi: "isolate" }}>{bpsToUsdc(r.share_bps, protocolFeeBps)}</span></td>
+            <td style={tdStyle}>{r.share_bps}</td>
+            <td style={tdStyle}>{bpsToPct(r.share_bps).toFixed(2)}%</td>
+            <td style={tdStyle}>
+              {formatStroops(settlement.payouts[i]?.netStroops ?? 0n)}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -455,6 +807,22 @@ export function SplitAllocationEditor({
   const [state, dispatch] = useReducer(editorReducer, initialState);
   const [forwardingOpen, setForwardingOpen] = useState(false);
   const [confirmReset, setConfirmReset]     = useState(false);
+  merchantAddress,
+  maxRecipients = DEFAULT_MAX_RECIPIENTS,
+  protocolFeeBps = DEFAULT_PROTOCOL_FEE_BPS,
+  externalForwardConfigs = EMPTY_FORWARD_CONFIGS,
+  pendingPayoutCount = 0,
+  maxForwardDepth = DEFAULT_MAX_FORWARD_DEPTH,
+  onPresetApplied,
+  onSave,
+}: SplitAllocationEditorProps) {
+  const [state, dispatch] = useReducer(editorReducer, initialState);
+  const [forwardingOpen, setForwardingOpen] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [presetError, setPresetError] = useState<string | null>(null);
+  const [presetNotice, setPresetNotice] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const formId = useId();
 
   const { recipients, forwardingRules, inputMode } = state;
@@ -473,13 +841,140 @@ export function SplitAllocationEditor({
   const hasInvalidAddresses = recipients.some((r) => r.address.trim() !== "" && !isValidStellarAddress(r.address));
   const hasForwardInvalid   = forwardingRules.some((r) => r.forward_to.trim() !== "" && !isValidStellarAddress(r.forward_to));
   const canSave = isExact && duplicateAddresses.size === 0 && !hasInvalidAddresses && !hasForwardInvalid && cycleAddresses === null && recipients.every((r) => r.address.trim() !== "");
+  const duplicateAddresses = useMemo(
+    () => findDuplicateAddresses(recipients.map((r) => r.address)),
+    [recipients]
+  );
+
+  const forwardEdges = useMemo<ForwardEdge[]>(
+    () => [
+      ...externalForwardConfigs,
+      ...forwardingRules
+        .filter((r) => r.forward_to.trim() !== "")
+        .map((r) => ({
+          merchant: r.merchant.trim(),
+          forward_to: r.forward_to.trim(),
+          forward_bps: r.forward_bps,
+          active: r.active,
+        })),
+    ],
+    [externalForwardConfigs, forwardingRules]
+  );
+
+  const forwardAnalysis = useMemo(
+    () =>
+      analyzeForwardGraph({
+        edges: forwardEdges,
+        maxDepth: maxForwardDepth,
+      }),
+    [forwardEdges, maxForwardDepth]
+  );
+
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
+  );
+
+  const hasInvalidAddresses = recipients.some(
+    (r) => r.address.trim() !== "" && !isValidStellarAddress(r.address)
+  );
+  const hasForwardInvalid = forwardingRules.some(
+    (r) =>
+      (r.forward_to.trim() !== "" && !isValidStellarAddress(r.forward_to)) ||
+      (r.merchant.trim() !== "" && !isValidStellarAddress(r.merchant))
+  );
+  const hasIncompleteForward = forwardingRules.some(
+    (r) => r.forward_to.trim() === "" || r.merchant.trim() === ""
+  );
+
+  const canSave =
+    isExact &&
+    recipients.length <= maxRecipients &&
+    duplicateAddresses.size === 0 &&
+    !hasInvalidAddresses &&
+    !hasForwardInvalid &&
+    !hasIncompleteForward &&
+    forwardAnalysis.isValid &&
+    recipients.every((r) => r.address.trim() !== "");
 
   function handleSave() {
     if (!canSave || !onSave) return;
     onSave({
       recipients: recipients.map((r) => ({ address: r.address.trim(), share_bps: r.share_bps })),
       forwardingRules: forwardingRules.map((r) => ({ merchant: merchantAddress, forward_to: r.forward_to.trim(), forward_bps: r.forward_bps, active: r.active })),
+      recipients: recipients.map((r) => ({
+        address: r.address.trim(),
+        share_bps: r.share_bps,
+      })),
+      forwardingRules: forwardingRules.map((r) => ({
+        merchant: r.merchant.trim(),
+        forward_to: r.forward_to.trim(),
+        forward_bps: r.forward_bps,
+        active: r.active,
+      })),
     });
+  }
+
+  function buildPreset(): SplitPreset {
+    return {
+      schema: SPLIT_PRESET_SCHEMA,
+      name:
+        presetName.trim() ||
+        `split-preset-${new Date().toISOString().slice(0, 10)}`,
+      createdAt: new Date().toISOString(),
+      merchantAddress,
+      protocolFeeBps,
+      recipients: recipients.map((r) => ({
+        address: r.address.trim(),
+        share_bps: r.share_bps,
+        isDustSink: r.isDustSink,
+      })),
+      forwardingRules: forwardingRules.map((r) => ({
+        merchant: r.merchant.trim(),
+        forward_to: r.forward_to.trim(),
+        forward_bps: r.forward_bps,
+        active: r.active,
+      })),
+    };
+  }
+
+  function handleExportPreset() {
+    if (!canSave) return;
+    const preset = buildPreset();
+    downloadSplitPreset(preset);
+    setPresetError(null);
+    setPresetNotice(`Exported "${preset.name}" as JSON for team review.`);
+  }
+
+  function handleCopyPreset() {
+    if (!canSave) return;
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      void navigator.clipboard.writeText(serializeSplitPreset(buildPreset()));
+    }
+    setPresetError(null);
+    setPresetNotice("Preset JSON copied to clipboard.");
+  }
+
+  async function handleImportPreset(file: File | undefined) {
+    if (!file) return;
+    try {
+      const parsed = parseSplitPreset(await file.text(), maxRecipients);
+      dispatch({ type: "LOAD_PRESET", preset: parsed });
+      setPresetName(parsed.name);
+      setPresetError(null);
+      setPresetNotice(`Loaded preset "${parsed.name}". Review before saving.`);
+      onPresetApplied?.(parsed);
+    } catch (error) {
+      setPresetNotice(null);
+      setPresetError(
+        error instanceof Error ? error.message : "Unable to import preset"
+      );
+    }
   }
 
   function handleReset() {
@@ -538,13 +1033,101 @@ export function SplitAllocationEditor({
 
           {cycleAddresses && (
             <div role="alert" style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 4, paddingBlock: 8, paddingInline: 10, fontSize: 12, color: "#991b1b", marginBlockEnd: 8 }}>
+          {/* Forwarding cycle error banner */}
+          {forwardAnalysis.cycles.map((cycle, index) => (
+            <div
+              key={`cycle-${index}`}
+              role="alert"
+              style={{
+                background: "#fef2f2",
+                border: "1px solid #fca5a5",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#991b1b",
+                marginBottom: 8,
+              }}
+            >
               <strong>⚠ Cycle detected:</strong>{" "}
-              {cycleAddresses.map((a, i) => (
+              {cycle.map((a, i) => (
                 <span key={i}>
                   <code dir="ltr" style={{ unicodeBidi: "isolate", fontFamily: "monospace" }}>{a.length > 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a}</code>
                   {i < cycleAddresses.length - 1 ? " → " : ""}
+                  <code style={{ fontFamily: "monospace" }}>
+                    {a.length > 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a}
+                  </code>
+                  {i < cycle.length - 1 ? " → " : ""}
                 </span>
               ))}{" "}forms a loop.
+            </div>
+          ))}
+
+          {/* Hop-TTL breach banner */}
+          {forwardAnalysis.ttlBreaches.map((chain, index) => (
+            <div
+              key={`ttl-${index}`}
+              role="alert"
+              style={{
+                background: "#fff7ed",
+                border: "1px solid #fdba74",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#9a3412",
+                marginBottom: 8,
+              }}
+            >
+              <strong>⚠ Hop limit exceeded:</strong> this forwarding chain is longer
+              than the {maxForwardDepth}-hop contract limit: {" "}
+              <code style={{ fontFamily: "monospace" }}>
+                {chain.map((a) => (a.length > 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a)).join(" → ")}
+              </code>
+            </div>
+          ))}
+
+          {/* Pending scheduled payouts warning */}
+          {pendingPayoutCount > 0 && (
+            <div
+              role="status"
+              style={{
+                background: "#eff6ff",
+                border: "1px solid #bfdbfe",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#1e40af",
+                marginBottom: 8,
+              }}
+            >
+              <strong>Pending payouts:</strong> {pendingPayoutCount} scheduled
+              payout{pendingPayoutCount === 1 ? "" : "s"} are queued. Changing
+              forwarding targets may not affect already-scheduled transfers.
+            </div>
+          )}
+
+          {/* Sub-stroop dust rounding sink warning */}
+          {settlement.dustRemainderStroops > 0n && (
+            <div
+              role="status"
+              style={{
+                background: "#fffbeb",
+                border: "1px solid #fde68a",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#92400e",
+                marginBottom: 8,
+              }}
+            >
+              <strong>Dust-rounding sink:</strong> integer division of the 10,000 bps
+              split leaves {settlement.dustRemainderStroops.toString()} sub-stroop
+              remainder stroop(s), assigned to{" "}
+              <code style={{ fontFamily: "monospace" }}>
+                {settlement.dustSinkAddress
+                  ? `${settlement.dustSinkAddress.slice(0, 6)}…${settlement.dustSinkAddress.slice(-4)}`
+                  : "—"}
+              </code>
+              .
             </div>
           )}
 
@@ -552,6 +1135,48 @@ export function SplitAllocationEditor({
             <button type="button" onClick={() => dispatch({ type: "ADD_RECIPIENT" })} disabled={recipients.length >= maxRecipients} style={toolbarBtn(recipients.length >= maxRecipients)}>+ Add Recipient</button>
             <button type="button" onClick={() => dispatch({ type: "SPLIT_EVENLY" })} style={toolbarBtn(false)}>Split Evenly</button>
             <button type="button" onClick={handleReset} style={toolbarBtn(false, true)}>Reset</button>
+          {/* Toolbar */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "ADD_RECIPIENT" })}
+              disabled={recipients.length >= maxRecipients}
+              title={
+                recipients.length >= maxRecipients
+                  ? `Maximum ${maxRecipients} recipients reached`
+                  : undefined
+              }
+              style={toolbarBtn(false)}
+            >
+              + Add Recipient
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "SPLIT_EVENLY" })}
+              style={toolbarBtn(false)}
+            >
+              Split Evenly
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "AUTO_BALANCE" })}
+              disabled={isExact}
+              title={
+                isExact
+                  ? "Allocation already totals exactly 10,000 bps"
+                  : "Assign the remaining bps to the dust-sink recipient"
+              }
+              style={toolbarBtn(isExact)}
+            >
+              Auto-balance remainder
+            </button>
+            <button
+              type="button"
+              onClick={handleReset}
+              style={toolbarBtn(false, true)}
+            >
+              Reset
+            </button>
           </div>
 
           {confirmReset && (
@@ -578,6 +1203,24 @@ export function SplitAllocationEditor({
                 </p>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 160px 60px auto", gap: 8, fontSize: 11, color: "#6b7280", paddingBlockEnd: 4, borderBlockEnd: "1px solid #e5e7eb" }}>
                   <span>Forward-to Address</span><span>Amount</span><span>Active</span><span>Del</span>
+
+                {/* Column headers */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr 160px 60px auto",
+                    gap: 8,
+                    fontSize: 11,
+                    color: "#6b7280",
+                    paddingBottom: 4,
+                    borderBottom: "1px solid #e5e7eb",
+                  }}
+                >
+                  <span>From (merchant)</span>
+                  <span>Forward-to Address</span>
+                  <span>Amount</span>
+                  <span>Active</span>
+                  <span>Del</span>
                 </div>
                 {forwardingRules.map((rule) => (
                   <ForwardingRuleRow key={rule.id} rule={rule} inputMode={inputMode}
@@ -585,6 +1228,16 @@ export function SplitAllocationEditor({
                     onRemove={(id) => dispatch({ type: "REMOVE_FORWARD_RULE", id })} />
                 ))}
                 <button type="button" onClick={() => dispatch({ type: "ADD_FORWARD_RULE" })} style={{ ...toolbarBtn(false), marginBlockStart: 8 }}>+ Add Forwarding Rule</button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    dispatch({ type: "ADD_FORWARD_RULE", merchant: merchantAddress })
+                  }
+                  style={{ ...toolbarBtn(false), marginTop: 8 }}
+                >
+                  + Add Forwarding Rule
+                </button>
               </div>
             )}
           </div>
@@ -593,6 +1246,104 @@ export function SplitAllocationEditor({
           <button type="button" onClick={handleSave} disabled={!canSave}
             title={!canSave ? "Resolve all errors before saving" : "Save configuration to contract"}
             style={{ marginBlockStart: 16, paddingBlock: 10, paddingInline: 20, background: canSave ? "#16a34a" : "#d1d5db", color: canSave ? "#fff" : "#6b7280", border: "none", borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: canSave ? "pointer" : "not-allowed", width: "100%" }}>
+          {/* Reusable split presets */}
+          <div
+            style={{
+              marginTop: 20,
+              padding: 12,
+              border: "1px solid #e5e7eb",
+              borderRadius: 6,
+              background: "#fafafa",
+            }}
+          >
+            <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+              Reusable split preset
+            </h3>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input
+                type="text"
+                aria-label="Preset name"
+                placeholder="Preset name (e.g. Q4 revenue share)"
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                style={{
+                  flex: "1 1 200px",
+                  padding: "6px 8px",
+                  border: "1px solid #d1d5db",
+                  borderRadius: 4,
+                  fontSize: 12,
+                }}
+              />
+              <button
+                type="button"
+                onClick={handleExportPreset}
+                disabled={!canSave}
+                style={toolbarBtn(!canSave)}
+              >
+                Export JSON
+              </button>
+              <button
+                type="button"
+                onClick={handleCopyPreset}
+                disabled={!canSave}
+                style={toolbarBtn(!canSave)}
+              >
+                Copy JSON
+              </button>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                style={toolbarBtn(false)}
+              >
+                Import JSON
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                aria-label="Import split preset JSON"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  void handleImportPreset(e.target.files?.[0]);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+            {presetError && (
+              <p role="alert" style={{ color: "#dc2626", fontSize: 11, margin: "6px 0 0" }}>
+                {presetError}
+              </p>
+            )}
+            {presetNotice && (
+              <p role="status" style={{ color: "#166534", fontSize: 11, margin: "6px 0 0" }}>
+                {presetNotice}
+              </p>
+            )}
+          </div>
+
+          {/* Save button */}
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={!canSave}
+            title={
+              !canSave
+                ? "Resolve all errors before saving"
+                : "Save configuration to contract"
+            }
+            style={{
+              marginTop: 16,
+              padding: "10px 20px",
+              background: canSave ? "#16a34a" : "#d1d5db",
+              color: canSave ? "#fff" : "#6b7280",
+              border: "none",
+              borderRadius: 6,
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: canSave ? "pointer" : "not-allowed",
+              width: "100%",
+            }}
+          >
             Save Configuration
           </button>
         </div>
@@ -608,6 +1359,22 @@ export function SplitAllocationEditor({
 
           <div style={{ border: "1px solid #e5e7eb", borderRadius: 6, paddingBlock: 12, paddingInline: 12, background: "#fafafa", overflowX: "auto" }}>
             <FlowPreview recipients={recipients} forwardingRules={forwardingRules} protocolFeeBps={protocolFeeBps} cycleAddresses={cycleAddresses} />
+          {/* SVG diagram */}
+          <div
+            style={{
+              border: "1px solid #e5e7eb",
+              borderRadius: 6,
+              padding: 12,
+              background: "#fafafa",
+              overflowX: "auto",
+            }}
+          >
+            <FlowPreview
+              recipients={recipients}
+              forwardingRules={forwardingRules}
+              protocolFeeBps={protocolFeeBps}
+              forwardAnalysis={forwardAnalysis}
+            />
           </div>
 
           <details style={{ marginBlockStart: 12 }}>

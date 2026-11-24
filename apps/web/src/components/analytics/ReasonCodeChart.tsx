@@ -61,6 +61,27 @@ export interface EpochDataPoint {
   Unauthorized: number | null;
   CustomerRequest: number | null;
   Other: number | null;
+  /**
+   * Total transactions observed in this epoch. Used to decide whether the
+   * epoch has a large enough sample for percentage deltas to be meaningful.
+   * When omitted, the epoch is treated as having a sufficient sample.
+   */
+  transactionCount?: number | null;
+}
+
+/**
+ * A single row from the on-chain `get_reason_code_velocity_delta` view.
+ * `deltaPct` is the epoch-over-epoch percentage change for the reason code.
+ */
+export interface ReasonCodeVelocityDelta {
+  reasonCode: ReasonCodeKey | string;
+  /** Percentage change vs. the previous epoch (null when undefined). */
+  deltaPct: number | null;
+  /** Optional absolute counts for the current / previous epochs. */
+  currentCount?: number | null;
+  previousCount?: number | null;
+  /** Optional per-epoch sample size for the current epoch. */
+  transactionCount?: number | null;
 }
 
 export interface ReasonCodeChartProps {
@@ -73,7 +94,17 @@ export interface ReasonCodeChartProps {
   hasError?: boolean;
   /** BCP 47 locale for date formatting */
   locale?: string;
+  /**
+   * Velocity deltas sourced from `get_reason_code_velocity_delta`. When
+   * provided these are preferred over client-computed deltas in the table.
+   */
+  velocityDeltas?: ReasonCodeVelocityDelta[];
+  /** Minimum transactions per epoch before percentage deltas are shown. */
+  minSampleSize?: number;
 }
+
+/** Default minimum epoch sample size before percentage deltas are trusted. */
+export const DEFAULT_MIN_SAMPLE_SIZE = 5;
 
 type ViewMode = 'chart' | 'table';
 
@@ -93,6 +124,37 @@ function formatDate(isoDate: string, locale = 'en-CA'): string {
 function computeDelta(current: number | null, previous: number | null): number | null {
   if (current === null || previous === null || previous === 0) return null;
   return ((current - previous) / previous) * 100;
+}
+
+/**
+ * An epoch has an insufficient sample when its transaction count is known and
+ * below the minimum threshold. Unknown counts are treated as sufficient so we
+ * never hide data we cannot reason about.
+ */
+function isInsufficientSample(
+  transactionCount: number | null | undefined,
+  minSampleSize: number,
+): boolean {
+  return (
+    typeof transactionCount === 'number' &&
+    Number.isFinite(transactionCount) &&
+    transactionCount < minSampleSize
+  );
+}
+
+/**
+ * Normalize a raw velocity-delta payload into a lookup keyed by reason code.
+ * Unknown reason codes are ignored so the chart only renders known series.
+ */
+function buildVelocityDeltaMap(
+  deltas: ReasonCodeVelocityDelta[] | undefined,
+): Map<string, ReasonCodeVelocityDelta> {
+  const map = new Map<string, ReasonCodeVelocityDelta>();
+  if (!deltas) return map;
+  for (const d of deltas) {
+    if (d && typeof d.reasonCode === 'string') map.set(d.reasonCode, d);
+  }
+  return map;
 }
 
 function formatDelta(delta: number | null): string {
@@ -330,6 +392,38 @@ function TableView({ data, visibleSeries, chartId, locale }: TableViewProps) {
     <div style={{ overflowX: 'auto' }}>
       <table aria-labelledby={captionId} style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
         <caption id={captionId} style={{ textAlign: 'start', fontWeight: 600, marginBlockEnd: 8, fontSize: 14 }}>
+interface TableViewProps {
+  data: EpochDataPoint[];
+  visibleSeries: Set<ReasonCodeKey>;
+  chartId: string;
+  velocityDeltaMap: Map<string, ReasonCodeVelocityDelta>;
+  minSampleSize: number;
+}
+
+function TableView({
+  data,
+  visibleSeries,
+  chartId,
+  velocityDeltaMap,
+  minSampleSize,
+}: TableViewProps) {
+  const captionId = `${chartId}-table-caption`;
+  const activeSeries = useMemo(
+    () => REASON_CODE_SERIES.filter((s) => visibleSeries.has(s.key)),
+    [visibleSeries],
+  );
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table
+        aria-labelledby={captionId}
+        aria-label="Refund reason-code velocity data table"
+        style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}
+      >
+        <caption
+          id={captionId}
+          style={{ textAlign: 'left', fontWeight: 600, marginBottom: 8, fontSize: 14 }}
+        >
           Refund Reason-Code Velocity — Tabular View
         </caption>
         <thead>
@@ -341,12 +435,26 @@ function TableView({ data, visibleSeries, chartId, locale }: TableViewProps) {
             ))}
             {REASON_CODE_SERIES.filter((s) => visibleSeries.has(s.key)).map((s) => (
               <th scope="col" key={`${s.key}-delta`} style={thStyle}>{s.label} Δ</th>
+            <th scope="col" style={thStyle}>Txns</th>
+            {activeSeries.map((s) => (
+              <th scope="col" key={s.key} style={thStyle}>
+                {s.label}
+              </th>
+            ))}
+            {activeSeries.map((s) => (
+              <th scope="col" key={`${s.key}-delta`} style={thStyle}>
+                {s.label} Δ
+              </th>
             ))}
           </tr>
         </thead>
         <tbody>
           {data.map((pt, i) => {
             const prev = i > 0 ? data[i - 1] : null;
+            const insufficient = isInsufficientSample(
+              pt.transactionCount,
+              minSampleSize,
+            );
             return (
               <tr key={pt.epochIndex} style={{ borderBlockEnd: '1px solid rgba(0,0,0,0.06)' }}>
                 <td style={tdStyle}>
@@ -357,17 +465,49 @@ function TableView({ data, visibleSeries, chartId, locale }: TableViewProps) {
                   <span dir="ltr" style={{ unicodeBidi: 'isolate', fontVariantNumeric: 'tabular-nums' }}>{pt.epochIndex}</span>
                 </td>
                 {REASON_CODE_SERIES.filter((s) => visibleSeries.has(s.key)).map((s) => (
+              <tr
+                key={pt.epochIndex}
+                style={{ borderBottom: '1px solid rgba(0,0,0,0.06)' }}
+              >
+                <td style={tdStyle}>{formatDate(pt.date)}</td>
+                <td style={tdStyle}>{pt.epochIndex}</td>
+                <td style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums' }}>
+                  {typeof pt.transactionCount === 'number'
+                    ? pt.transactionCount.toLocaleString()
+                    : '—'}
+                </td>
+                {activeSeries.map((s) => (
                   <td key={s.key} style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums' }}>
                     <span dir="ltr" style={{ unicodeBidi: 'isolate' }}>
                       {pt[s.key] === null ? '—' : (pt[s.key] as number).toLocaleString()}
                     </span>
                   </td>
                 ))}
-                {REASON_CODE_SERIES.filter((s) => visibleSeries.has(s.key)).map((s) => {
-                  const delta = computeDelta(pt[s.key], prev ? prev[s.key] : null);
+                {activeSeries.map((s) => {
+                  const onChain = velocityDeltaMap.get(s.key);
+                  const delta = insufficient
+                    ? null
+                    : onChain && onChain.deltaPct !== undefined
+                      ? onChain.deltaPct
+                      : computeDelta(pt[s.key], prev ? prev[s.key] : null);
                   return (
                     <td key={`${s.key}-delta`} style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums', color: deltaColor(delta) }}>
                       <span dir="ltr" style={{ unicodeBidi: 'isolate' }}>{formatDelta(delta)}</span>
+                    <td
+                      key={`${s.key}-delta`}
+                      style={{
+                        ...tdStyle,
+                        fontVariantNumeric: 'tabular-nums',
+                        color: deltaColor(delta),
+                      }}
+                    >
+                      {insufficient ? (
+                        <span title="Insufficient sample size">
+                          Insufficient sample
+                        </span>
+                      ) : (
+                        formatDelta(delta)
+                      )}
                     </td>
                   );
                 })}
@@ -388,10 +528,35 @@ export function ReasonCodeChart({
   data, allowLogScale = false, defaultVisibleSeries, chartId,
   onRetry, hasError = false,
   locale = typeof navigator !== 'undefined' ? navigator.language : 'en-US',
+  data,
+  allowLogScale = false,
+  defaultVisibleSeries,
+  chartId,
+  onRetry,
+  hasError = false,
+  velocityDeltas,
+  minSampleSize = DEFAULT_MIN_SAMPLE_SIZE,
 }: ReasonCodeChartProps) {
   const uid = useId();
   const toggleGroupId = `${chartId}-toggle-${uid}`;
 
+  // Memoized transforms for large multi-epoch datasets.
+  const velocityDeltaMap = useMemo(
+    () => buildVelocityDeltaMap(velocityDeltas),
+    [velocityDeltas],
+  );
+
+  const insufficientEpochCount = useMemo(
+    () =>
+      data.reduce(
+        (acc, pt) =>
+          acc + (isInsufficientSample(pt.transactionCount, minSampleSize) ? 1 : 0),
+        0,
+      ),
+    [data, minSampleSize],
+  );
+
+  // View mode (chart / table) persisted to localStorage
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     try { return (localStorage.getItem(`analytics.viewMode.${chartId}`) as ViewMode) ?? 'chart'; }
     catch { return 'chart'; }
@@ -421,6 +586,22 @@ export function ReasonCodeChart({
   const outlierWarning = useMemo(() => isOutlierPresent(data), [data]);
   const isEmpty  = data.length === 0;
   const allZero  = !isEmpty && REASON_CODE_SERIES.every((s) => data.every((pt) => !pt[s.key]));
+  const isEmpty = data.length === 0;
+  const allZero = useMemo(
+    () =>
+      !isEmpty &&
+      REASON_CODE_SERIES.every((s) => data.every((pt) => !pt[s.key])),
+    [data, isEmpty],
+  );
+
+  // Keyboard handler for toggle group
+  const handleToggleKeyDown = (
+    e: React.KeyboardEvent<HTMLButtonElement>,
+    current: ViewMode,
+  ) => {
+    if (e.key === 'ArrowLeft') handleViewMode('chart');
+    if (e.key === 'ArrowRight') handleViewMode('table');
+  };
 
   return (
     <div style={{ background: '#fff', border: '1px solid rgba(0,0,0,0.1)', borderRadius: 8, overflow: 'hidden', fontFamily: 'system-ui, sans-serif' }}>
@@ -452,6 +633,28 @@ export function ReasonCodeChart({
           </div>
         )}
 
+        {/* Insufficient sample size annotation */}
+        {!hasError && !isEmpty && !allZero && insufficientEpochCount > 0 && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              margin: '0 16px 8px',
+              padding: '6px 10px',
+              background: 'rgba(0,114,178,0.10)',
+              borderRadius: 4,
+              fontSize: 12,
+              color: '#004a75',
+            }}
+          >
+            Insufficient Sample Size — {insufficientEpochCount} epoch
+            {insufficientEpochCount !== 1 ? 's have' : ' has'} fewer than{' '}
+            {minSampleSize} transactions. Percentage velocity deltas are hidden
+            for those epochs to avoid misleading trends.
+          </div>
+        )}
+
+        {/* Outlier warning */}
         {!hasError && !isEmpty && !allZero && outlierWarning && !logScale && (
           <div role="status" style={{ marginBlockEnd: 8, marginInline: 16, paddingBlock: 6, paddingInline: 10, background: 'rgba(230,159,0,0.12)', borderRadius: 4, fontSize: 12, color: '#7a5500' }}>
             Outlier detected — consider enabling log scale for better readability.
@@ -465,6 +668,14 @@ export function ReasonCodeChart({
             ) : (
               <div style={{ paddingBlockEnd: 12, paddingInline: 16 }}>
                 <TableView data={data} visibleSeries={visibleSeries} chartId={chartId} locale={locale} />
+              <div style={{ padding: '0 16px 12px' }}>
+                <TableView
+                  data={data}
+                  visibleSeries={visibleSeries}
+                  chartId={chartId}
+                  velocityDeltaMap={velocityDeltaMap}
+                  minSampleSize={minSampleSize}
+                />
               </div>
             )}
             {viewMode === 'chart' && tooltip && (
