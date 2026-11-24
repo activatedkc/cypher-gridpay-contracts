@@ -16,6 +16,6 @@ escrow = { path = "../escrow" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 escrow = { path = "../escrow" }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
-rand = "0.8.5"
+rand = "0.10.3"
 proptest = "1.4.0"
 test_utils = { workspace = true }
